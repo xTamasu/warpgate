@@ -115,6 +115,25 @@ fn session_debug_tag(id: &SessionId, remote_address: &SocketAddr) -> String {
     format!("[{id} - {remote_address}]")
 }
 
+fn format_web_auth_instructions(login_url: impl std::fmt::Display, identification_string: &str) -> String {
+    let spaced_key = identification_string
+        .chars()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        concat!(
+            "-----------------------------------------------------------------------\n",
+            "Warpgate authentication: please open the following URL in your browser:\n",
+            "{}\n\n",
+            "Make sure you're seeing this security key: {}\n",
+            "-----------------------------------------------------------------------\n"
+        ),
+        login_url,
+        spaced_key,
+    )
+}
+
 impl std::fmt::Debug for ServerSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", session_debug_tag(&self.id, &self.remote_address))
@@ -1533,9 +1552,42 @@ impl ServerSession {
             Ok(AuthResult::Need(kinds)) => {
                 if kinds.contains(&CredentialKind::Totp) {
                     self.keyboard_interactive_state = KeyboardInteractiveState::OtpRequested;
+                    let instructions = if let Some(auth_state) = self.auth_state.as_ref() {
+                        let identification_string =
+                            auth_state.lock().await.identification_string().to_owned();
+                        if identification_string.is_empty() {
+                            Cow::Borrowed("")
+                        } else {
+                            match construct_external_url(
+                                None,
+                                &*self.services.config.lock().await,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(ext_url) => {
+                                    let login_url =
+                                        auth_state.lock().await.construct_web_approval_url(ext_url);
+                                    Cow::Owned(format_web_auth_instructions(
+                                        login_url,
+                                        &identification_string,
+                                    ))
+                                }
+                                Err(error) => {
+                                    error!(?error, "Failed to construct external URL");
+                                    return Ok(russh::server::Auth::Reject {
+                                        proceed_with_methods: None,
+                                        partial_success: false,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        Cow::Borrowed("")
+                    };
                     russh::server::Auth::Partial {
                         name: Cow::Borrowed("Two-factor authentication"),
-                        instructions: Cow::Borrowed(""),
+                        instructions,
                         prompts: Cow::Owned(vec![(Cow::Borrowed("One-time password: "), true)]),
                     }
                 } else if kinds.contains(&CredentialKind::WebUserApproval) {
@@ -1545,9 +1597,10 @@ impl ServerSession {
                             partial_success: false,
                         });
                     };
-                    let identification_string =
-                        auth_state.lock().await.identification_string().to_owned();
-                    let auth_state_id = *auth_state.lock().await.id();
+                    let (identification_string, auth_state_id) = {
+                        let guard = auth_state.lock().await;
+                        (guard.identification_string().to_owned(), *guard.id())
+                    };
                     let event = self
                         .services
                         .auth_state_store
@@ -1576,20 +1629,9 @@ impl ServerSession {
 
                     russh::server::Auth::Partial {
                         name: Cow::Borrowed("Warpgate authentication"),
-                        instructions: Cow::Owned(format!(
-                            concat!(
-                                "-----------------------------------------------------------------------\n",
-                                "Warpgate authentication: please open the following URL in your browser:\n",
-                                "{}\n\n",
-                                "Make sure you're seeing this security key: {}\n",
-                                "-----------------------------------------------------------------------\n"
-                            ),
-                            login_url,
-                            identification_string
-                                .chars()
-                                .map(|x| x.to_string())
-                                .collect::<Vec<_>>()
-                                .join(" ")
+                        instructions: Cow::Owned(format_web_auth_instructions(
+                            &login_url,
+                            &identification_string,
                         )),
                         prompts: Cow::Owned(vec![(Cow::Borrowed("Press Enter when done: "), true)]),
                     }
